@@ -37,19 +37,21 @@ class CaptureLoggerSurfaceTest {
     }
 
     @Test
-    void builderRejectsDropOldUntilImplemented() {
-        // DROP_OLD is declared on the enum but Step 2 doesn't
-        // implement true oldest-eviction in the MPSC ring. Until
-        // Step 6, the Builder rejects it at startup so deployments
-        // can't silently get the wrong policy. The enum stays
-        // public so callers writing "policy=DROP_OLD" don't compile-
-        // break the moment Step 6 lands.
-        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
-                () -> CaptureLogger.builder()
-                        .overflowPolicy(OverflowPolicy.DROP_OLD)
-                        .build());
-        assertTrue(ex.getMessage().contains("DROP_OLD"),
-                "error message should name the policy: " + ex.getMessage());
+    void builderAcceptsBothOverflowPoliciesAsOfStep6() {
+        // Step 6 implements real DROP_OLD via producer-side
+        // eviction. Both policies must build cleanly.
+        try (CaptureLogger ignored = CaptureLogger.builder()
+                .sink(new ListSink())
+                .overflowPolicy(OverflowPolicy.DROP_NEW)
+                .build()) {
+            // OK
+        }
+        try (CaptureLogger ignored = CaptureLogger.builder()
+                .sink(new ListSink())
+                .overflowPolicy(OverflowPolicy.DROP_OLD)
+                .build()) {
+            // OK
+        }
     }
 
     @Test
@@ -162,7 +164,11 @@ class CaptureLoggerSurfaceTest {
                 });
             }
             start.countDown();
-            done.await(10, TimeUnit.SECONDS);
+            // Assert the timed await actually completed — without
+            // this, a stuck worker would let the test pass on weak
+            // post-quiescence invariants below.
+            assertTrue(done.await(10, TimeUnit.SECONDS),
+                    "all producer threads must complete within 10s");
             pool.shutdown();
 
             // Post-join, traffic is quiesced — the three counters

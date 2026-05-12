@@ -424,10 +424,14 @@ class CaptureLoggerPipelineTest {
         logger.close();
         // Now drain the producer threads — they'll all return
         // promptly because subsequent log() calls hit the dropped
-        // branch (closed=true).
-        finished.await(15, TimeUnit.SECONDS);
+        // branch (closed=true). Assert true on the timed waits so
+        // a stuck worker fails the test loudly instead of being
+        // hidden behind subsequent weak invariants.
+        assertTrue(finished.await(15, TimeUnit.SECONDS),
+                "all producer threads must return after close");
         pool.shutdown();
-        pool.awaitTermination(5, TimeUnit.SECONDS);
+        assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS),
+                "executor must terminate cleanly within 5s");
 
         CaptureLoggerStats s = logger.stats();
         // Strict invariant: every event counted as `logged` must
@@ -490,9 +494,14 @@ class CaptureLoggerPipelineTest {
             });
         }
         start.countDown();
-        done.await(15, TimeUnit.SECONDS);
+        // Timed awaits return false on timeout — assert true so a
+        // stuck producer fails the test instead of letting it
+        // continue with partial execution.
+        assertTrue(done.await(15, TimeUnit.SECONDS),
+                "all producer threads must complete within 15s");
         pool.shutdown();
-        pool.awaitTermination(5, TimeUnit.SECONDS);
+        assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS),
+                "executor must terminate cleanly within 5s");
         // All producers have returned; counters are stable.
         logger.close();
         // close() drained the ring synchronously, so every accepted

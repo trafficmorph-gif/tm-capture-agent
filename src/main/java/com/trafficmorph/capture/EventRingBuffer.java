@@ -21,7 +21,9 @@ import java.util.concurrent.atomic.AtomicLongArray;
  *   <li>This pattern: producers claim a slot via a single CAS; reads
  *       and writes go through {@code AtomicLongArray} sequence
  *       markers (volatile semantics, no locks). The single consumer
- *       is the writer thread, so its side is plain field access.</li>
+ *       is the writer thread; its consumerSeq is also AtomicLong so
+ *       a producer can race with it for eviction (see
+ *       {@link #offerOrEvict}).</li>
  * </ul>
  *
  * <h2>Slot lifecycle</h2>
@@ -50,8 +52,9 @@ import java.util.concurrent.atomic.AtomicLongArray;
  * <p>{@link #offer(CaptureEvent)} returns {@code false} immediately
  * when the slot the next claim would target hasn't yet been drained
  * by the consumer — i.e. the ring is full. No spinning, no blocking.
- * The caller (the producer in {@code CaptureLogger.log}) interprets
- * that as overflow and bumps the dropped counter.
+ * For DROP_OLD semantics, callers use {@link #offerOrEvict} which
+ * evicts the oldest event(s) under back-pressure until the new event
+ * fits.
  */
 final class EventRingBuffer {
 
@@ -64,11 +67,14 @@ final class EventRingBuffer {
     private final AtomicLong producerSeq = new AtomicLong(0);
 
     /**
-     * Next position the consumer would drain. Only the writer thread
-     * reads/writes this — no synchronisation needed. Stays a plain
-     * field; the per-slot sequences carry the cross-thread visibility.
+     * Next position the consumer would drain. AtomicLong so producer-
+     * side eviction (DROP_OLD) can race with the writer thread's
+     * normal poll — whoever wins the CAS owns the slot. The
+     * non-evicting code path is otherwise identical to a plain-long
+     * single-consumer counter; the CAS adds ~2-5ns on the consumer's
+     * hot path, acceptable for the eviction feature it enables.
      */
-    private long consumerSeq = 0;
+    private final AtomicLong consumerSeq = new AtomicLong(0);
 
     EventRingBuffer(int capacity) {
         if (capacity <= 0 || Integer.bitCount(capacity) != 1) {
@@ -90,8 +96,8 @@ final class EventRingBuffer {
     }
 
     /**
-     * Producer side. Returns {@code true} on success, {@code false}
-     * if the ring is full (caller drops + counts).
+     * Producer side, non-evicting. Returns {@code true} on success,
+     * {@code false} if the ring is full (caller drops + counts).
      *
      * <p>Lock-free; multiple producers can be in flight simultaneously
      * and never block each other. Each retry costs one re-read of
@@ -130,28 +136,131 @@ final class EventRingBuffer {
     }
 
     /**
+     * Producer side, DROP_OLD policy. Tries to make room by evicting
+     * the oldest event(s); returns information about the outcome so
+     * the caller can do correct stats accounting.
+     *
+     * <p>Per-eviction logic: CAS-advance {@link #consumerSeq} by one
+     * to atomically "steal" the oldest pending slot from the writer
+     * thread. The writer's {@link #poll()} also CASes its claim, so
+     * either party can win on a given slot — whoever loses sees a
+     * {@code null} or stale read and retries on the next round.
+     *
+     * <p>Bounded loop: an upper limit on eviction attempts prevents
+     * a pathological livelock if many producers concurrently evict
+     * faster than they offer. The limit is generous (2 ×
+     * {@code capacity}) so legitimate back-pressure always succeeds.
+     *
+     * <h2>Return value encoding</h2>
+     * <p>One {@code int} carries two pieces of information so the
+     * hot path doesn't allocate a result record:
+     * <ul>
+     *   <li><b>{@code result >= 0}</b> — success. {@code result} is
+     *       the number of evictions performed (may be 0). The new
+     *       event was enqueued; caller bumps {@code logged} by 1
+     *       and {@code dropped} by {@code result}.</li>
+     *   <li><b>{@code result < 0}</b> — gave up. The new event was
+     *       NOT enqueued. The number of evictions that occurred
+     *       before giving up is {@code -result - 1}. Caller bumps
+     *       {@code dropped} by ({@code -result - 1 + 1}) — the
+     *       extra +1 accounts for the new event itself, which is
+     *       lost.</li>
+     * </ul>
+     */
+    int offerOrEvict(CaptureEvent event) {
+        // Cap iterations defensively at 2 × capacity. Compute in
+        // LONG so a large valid {@code queueCapacity} (Builder
+        // allows up to {@code 1 << 30}) doesn't wrap to a negative
+        // int and silently short-circuit the retry loop. The prior
+        // bug: {@code int maxAttempts = capacity * 2} for
+        // {@code capacity = 1 << 30} produced
+        // {@code Integer.MIN_VALUE}, the loop never executed, and
+        // every DROP_OLD call returned the give-up sentinel
+        // regardless of whether eviction could have succeeded.
+        return offerOrEvict(event, (long) capacity * 2L);
+    }
+
+    /**
+     * Test seam. Same contract as the one-arg form but with an
+     * explicit upper bound on retry attempts. Calling with
+     * {@code maxAttempts == 0} forces an immediate give-up and is
+     * the deterministic way for tests to exercise the negative-
+     * sentinel return path without constructing pathological
+     * timing scenarios.
+     *
+     * <p>Package-private so production callers don't accidentally
+     * starve their producers by passing a too-low bound.
+     */
+    int offerOrEvict(CaptureEvent event, long maxAttempts) {
+        int evictions = 0;
+        for (long attempt = 0; attempt < maxAttempts; attempt++) {
+            if (offer(event)) return evictions;
+            if (evictOldest()) {
+                evictions++;
+            }
+            // If evictOldest returned false (writer is mid-drain, or
+            // another evictor took our target slot), loop and retry.
+        }
+        // Defensive fallthrough: couldn't make room despite many
+        // attempts. Event was NOT enqueued. Encode "gave up with N
+        // evictions performed" as -(N + 1) so the caller can recover
+        // both the failure bit AND the eviction count from one int.
+        return -(evictions + 1);
+    }
+
+    /**
+     * Try to evict the slot at the current {@link #consumerSeq}.
+     * Returns {@code true} if we successfully advanced past one
+     * pending event; {@code false} if the slot isn't consumer-ready
+     * (writer may be mid-drain; the next attempt will pick up the
+     * fresher state).
+     */
+    private boolean evictOldest() {
+        long cs = consumerSeq.get();
+        int idx = (int) (cs & mask);
+        long seq = sequences.get(idx);
+        // Slot must be in the "consumer-ready" state (sequence = cs+1)
+        // for us to evict it. Otherwise the writer is in the middle
+        // of a drain (sequence already at cs+capacity) or the slot
+        // simply hasn't been written yet — either way, retry from
+        // the freshest state.
+        if (seq != cs + 1) return false;
+        // CAS-claim the consumer position. If we lose, another evictor
+        // (or the writer) beat us to this slot; caller's outer loop
+        // will retry against the new consumerSeq.
+        if (!consumerSeq.compareAndSet(cs, cs + 1)) return false;
+        // We own this slot. Help GC by clearing the event, then mark
+        // the slot ready for the next round of producers (whose pos
+        // will be cs + capacity).
+        slots[idx] = null;
+        sequences.set(idx, cs + capacity);
+        return true;
+    }
+
+    /**
      * Consumer side. Returns the next event in FIFO order, or
-     * {@code null} when the ring is empty. Single-threaded — must
-     * only be called from the writer thread.
+     * {@code null} when the ring is empty.
+     *
+     * <p>Now also lock-free against producer-side eviction: claim
+     * via CAS on {@link #consumerSeq}. If the CAS loses, a
+     * producer evicted the slot first — return {@code null} and let
+     * the caller probe again. Steady-state (no eviction contention)
+     * cost: one extra CAS on the writer's hot path vs. the old
+     * plain-long version.
      */
     CaptureEvent poll() {
-        long pos = consumerSeq;
+        long pos = consumerSeq.get();
         int idx = (int) (pos & mask);
         long seq = sequences.get(idx);
-        long diff = seq - (pos + 1);
-        if (diff == 0) {
-            // Producer published at this slot. Read event, clear slot,
-            // mark the slot ready for the NEXT round of producers
-            // (their pos will be the current pos + capacity).
-            CaptureEvent e = slots[idx];
-            slots[idx] = null;                          // help GC
-            sequences.set(idx, pos + capacity);         // release: slot empty
-            consumerSeq = pos + 1;
-            return e;
-        }
-        // diff < 0: producer hasn't published yet → empty for this slot.
-        // (diff > 0 can't happen with a single consumer.)
-        return null;
+        if (seq != pos + 1) return null;
+        // CAS-claim. Lost CAS → an evicting producer beat us; the
+        // event at this position is gone. Return null so the caller
+        // retries (which reads the fresh consumerSeq).
+        if (!consumerSeq.compareAndSet(pos, pos + 1)) return null;
+        CaptureEvent e = slots[idx];
+        slots[idx] = null;
+        sequences.set(idx, pos + capacity);
+        return e;
     }
 
     /**
@@ -162,10 +271,32 @@ final class EventRingBuffer {
      */
     int approximateSize() {
         long p = producerSeq.get();
-        long c = consumerSeq;
+        long c = consumerSeq.get();
         long size = p - c;
         if (size < 0) return 0;
         if (size > capacity) return capacity;
         return (int) size;
+    }
+
+    /**
+     * Best-effort age of the oldest pending event, in seconds (per
+     * the supplied {@link TimeSource}'s clock). Returns 0 when the
+     * ring is empty or when a race causes the sampled slot to be
+     * cleared between reads.
+     *
+     * <p>Used by {@link CaptureLogger#stats()} to populate
+     * {@link CaptureLoggerStats#writerLagMs}. Approximate by design
+     * — stats is documented as a non-atomic snapshot.
+     */
+    double oldestPendingAgeSeconds(TimeSource clock) {
+        long pos = consumerSeq.get();
+        int idx = (int) (pos & mask);
+        long seq = sequences.get(idx);
+        if (seq != pos + 1) return 0d;       // slot not consumer-ready: ring empty here
+        CaptureEvent e = slots[idx];
+        if (e == null) return 0d;            // race: drained between reads
+        double now = clock.seconds();
+        double age = now - e.tSeconds();
+        return age > 0 ? age : 0d;            // clamp negative (wallclock NTP jumps)
     }
 }

@@ -256,14 +256,34 @@ public final class CaptureLogger implements AutoCloseable {
                     }
                 }
                 CaptureEvent event = new CaptureEvent(t, method, url, headersSnapshot, boundedBody);
-                if (!ring.offer(event)) {
-                    // Ring full. Only DROP_NEW is supported today
-                    // (Step 6 adds DROP_OLD); the Builder rejects
-                    // DROP_OLD up front so we don't have to branch.
-                    dropped.increment();
-                    return;
+                if (overflowPolicy == OverflowPolicy.DROP_OLD) {
+                    // DROP_OLD: try to enqueue by evicting older
+                    // events. The result encodes both outcome and
+                    // eviction count (see EventRingBuffer.offerOrEvict
+                    // javadoc):
+                    //   result >= 0: success, `result` evictions occurred.
+                    //   result <  0: gave up after extreme contention;
+                    //                evictions = -result - 1; new event lost.
+                    int result = ring.offerOrEvict(event);
+                    if (result >= 0) {
+                        if (result > 0) dropped.add(result);
+                        logged.increment();
+                    } else {
+                        int evictionsOccurred = -result - 1;
+                        // Account for both: the events we displaced AND
+                        // the new event we couldn't fit. All count as
+                        // dropped; none of them count as logged.
+                        dropped.add(evictionsOccurred + 1L);
+                    }
+                } else {
+                    // DROP_NEW (default): refuse the new event when
+                    // the ring is full.
+                    if (!ring.offer(event)) {
+                        dropped.increment();
+                        return;
+                    }
+                    logged.increment();
                 }
-                logged.increment();
             } catch (RuntimeException re) {
                 // Hot-path never throws on caller bugs. Concurrent
                 // map mutation during the snapshot (CME, ISE),
@@ -290,30 +310,47 @@ public final class CaptureLogger implements AutoCloseable {
      * Snapshot of producer-side counters. Cheap; safe from any thread.
      *
      * <p>{@link CaptureLoggerStats#dropped()} counts events lost
-     * because the logger refused to enqueue them (overflow, or
-     * post-close). {@link CaptureLoggerStats#invalidDropped()}
-     * counts events lost because the caller passed an invalid
-     * shape (null / blank method or url).
+     * for any reason on the producer side: overflow refusals
+     * (DROP_NEW), post-close refusals, AND — under DROP_OLD —
+     * evictions of previously-logged events that were displaced to
+     * make room for a newer event. {@link CaptureLoggerStats#invalidDropped()}
+     * counts events lost because the caller passed an invalid shape
+     * (null / blank method or url).
      *
-     * <p>The three counters partition every completed {@code log()}
-     * call eventually, BUT this method does NOT take an atomic
+     * <h2>Partition semantics depend on overflow policy</h2>
+     * <ul>
+     *   <li><b>DROP_NEW</b>: {@code logged + dropped + invalidDropped}
+     *       eventually equals the total number of {@code log()}
+     *       calls. Each call contributes to exactly one bucket.</li>
+     *   <li><b>DROP_OLD</b>: a single {@code log()} call can
+     *       contribute to BOTH {@code logged} (the new event was
+     *       enqueued) AND {@code dropped} (one or more older events
+     *       were displaced to make room). So
+     *       {@code logged + dropped + invalidDropped} may
+     *       <em>exceed</em> the total number of {@code log()} calls.
+     *       {@code dropped} should be read as "events lost" rather
+     *       than "calls refused" under this policy.</li>
+     * </ul>
+     *
+     * <p>And in either policy, this method does NOT take an atomic
      * snapshot — each {@code LongAdder.sum()} is read independently,
-     * so under live concurrent logging the three values can be
-     * sampled at slightly different instants. Operators treating
-     * the totals as approximate (looking at trends / ratios) are
-     * fine; callers that need {@code logged + dropped + invalidDropped}
-     * to add up to a specific total instant should quiesce traffic
-     * before sampling, or build their own atomic snapshot above
-     * this API.
+     * so under live concurrent logging the values can be sampled at
+     * slightly different instants. Treat as trend-bearing rather
+     * than strictly consistent.
      */
     public CaptureLoggerStats stats() {
+        // Best-effort writer lag: age of the oldest pending event,
+        // sampled via the same TimeSource the producer used to stamp
+        // it. Returns 0 when the ring is empty. Race-tolerant by
+        // design — stats() is documented as approximate.
+        long writerLagMs = (long) (ring.oldestPendingAgeSeconds(timeSource) * 1000);
         return new CaptureLoggerStats(
                 logged.sum(),
                 dropped.sum(),
                 invalidDropped.sum(),
                 writeFailed.sum(),
                 ring.approximateSize(),
-                /* writerLagMs */ 0L);
+                writerLagMs);
     }
 
     /**
@@ -356,11 +393,11 @@ public final class CaptureLogger implements AutoCloseable {
      * The writer thread is a daemon so the JVM will reap it; any
      * events still queued at that point are lost.
      *
-     * <p>(Note: {@link CaptureLoggerStats#writerLagMs()} is reserved
-     * for the actual "age of oldest queued event" metric, which is
-     * not yet computed — currently always 0. Step 6 wires that up;
-     * for now {@link #shutdownTimedOut()} is the authoritative
-     * unclean-shutdown signal.)
+     * <p>(For unclean-shutdown alerts, {@link #shutdownTimedOut()}
+     * is the authoritative signal. {@link CaptureLoggerStats#writerLagMs()}
+     * shows the queue's pre-shutdown lag if you sample it just
+     * before {@code close()}; after {@code close()} returns it
+     * tends to 0 because the ring is drained.)
      *
      * <h2>Race-free correctness when the budget isn't exhausted</h2>
      * <p>Flip {@code closed}, spin-wait (with brief parks) until
@@ -559,27 +596,13 @@ public final class CaptureLogger implements AutoCloseable {
 
         /**
          * What to do when the ring buffer is full. Defaults to
-         * {@link OverflowPolicy#DROP_NEW}.
-         *
-         * <p>{@link OverflowPolicy#DROP_OLD} is declared but NOT yet
-         * implemented — the MPSC ring's single-consumer invariant
-         * makes producer-side eviction non-trivial, and rather than
-         * silently treat it as DROP_NEW we reject it here. Step 6
-         * adds real DROP_OLD behaviour; until then,
-         * {@code overflowPolicy(DROP_OLD)} throws so misconfigured
-         * deployments fail loudly at startup rather than silently
-         * getting the wrong policy.
+         * {@link OverflowPolicy#DROP_NEW}; {@link OverflowPolicy#DROP_OLD}
+         * is fully supported as of Step 6 — producer-side eviction
+         * advances the consumer position via CAS, racing safely
+         * against the writer thread's own poll.
          */
         public Builder overflowPolicy(OverflowPolicy policy) {
-            Objects.requireNonNull(policy, "policy");
-            if (policy == OverflowPolicy.DROP_OLD) {
-                throw new IllegalArgumentException(
-                        "DROP_OLD is not yet implemented — the MPSC ring's "
-                                + "single-consumer invariant requires more careful "
-                                + "eviction logic, scheduled for Step 6. Use DROP_NEW "
-                                + "or wait for the upgrade.");
-            }
-            this.overflowPolicy = policy;
+            this.overflowPolicy = Objects.requireNonNull(policy, "policy");
             return this;
         }
 
