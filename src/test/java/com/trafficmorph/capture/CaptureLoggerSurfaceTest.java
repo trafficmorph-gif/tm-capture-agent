@@ -3,6 +3,7 @@ package com.trafficmorph.capture;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -11,16 +12,16 @@ import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
- * Step 1 smoke tests — pin down the public surface (builder
- * validation, counter shape, close-after-log semantics, blank-input
- * handling, thread-safety of counters) before the async pipeline
- * lands in Step 2.
+ * Public-surface tests for {@link CaptureLogger}: builder validation,
+ * counter shape, close semantics, blank-input handling, thread-safety
+ * of counters. Pipeline / formatting / FIFO concerns live in
+ * {@link CaptureLoggerPipelineTest}.
  *
- * <p>The actual write path is a no-op in Step 1; these tests will
- * grow into real pipeline tests as later steps add the ring buffer,
- * writer thread, formatter, and sinks.
+ * <p>All tests route through an in-memory {@link ListSink} rather
+ * than the default stdout sink, so the test runner output stays
+ * clean.
  */
-class CaptureLoggerSkeletonTest {
+class CaptureLoggerSurfaceTest {
 
     @Test
     void builderRejectsNonPowerOfTwoCapacity() {
@@ -36,6 +37,22 @@ class CaptureLoggerSkeletonTest {
     }
 
     @Test
+    void builderRejectsDropOldUntilImplemented() {
+        // DROP_OLD is declared on the enum but Step 2 doesn't
+        // implement true oldest-eviction in the MPSC ring. Until
+        // Step 6, the Builder rejects it at startup so deployments
+        // can't silently get the wrong policy. The enum stays
+        // public so callers writing "policy=DROP_OLD" don't compile-
+        // break the moment Step 6 lands.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> CaptureLogger.builder()
+                        .overflowPolicy(OverflowPolicy.DROP_OLD)
+                        .build());
+        assertTrue(ex.getMessage().contains("DROP_OLD"),
+                "error message should name the policy: " + ex.getMessage());
+    }
+
+    @Test
     void builderAcceptsPowersOfTwo() {
         // 64, 65 536, 1 048 576 — should all be accepted.
         CaptureLogger.builder().queueCapacity(64).build().close();
@@ -45,7 +62,7 @@ class CaptureLoggerSkeletonTest {
 
     @Test
     void logCountsAcceptedEventsAndDroppedAfterClose() {
-        try (CaptureLogger logger = CaptureLogger.builder().build()) {
+        try (CaptureLogger logger = CaptureLogger.builder().sink(new ListSink()).build()) {
             logger.log("GET", "https://api.example.com/x");
             logger.log("POST", "https://api.example.com/y");
             CaptureLoggerStats s = logger.stats();
@@ -57,7 +74,7 @@ class CaptureLoggerSkeletonTest {
 
     @Test
     void logAfterCloseIncrementsDroppedCounter() {
-        CaptureLogger logger = CaptureLogger.builder().build();
+        CaptureLogger logger = CaptureLogger.builder().sink(new ListSink()).build();
         logger.close();
         logger.log("GET", "https://api.example.com/x");
         CaptureLoggerStats s = logger.stats();
@@ -71,7 +88,7 @@ class CaptureLoggerSkeletonTest {
         // Javadoc promises method/url are non-blank. The contract
         // is enforced quietly: blank input → invalidDropped++, never
         // an exception (logger-never-throws on hot paths).
-        try (CaptureLogger logger = CaptureLogger.builder().build()) {
+        try (CaptureLogger logger = CaptureLogger.builder().sink(new ListSink()).build()) {
             logger.log(null, "https://x");
             logger.log("GET", null);
             logger.log("", "https://x");
@@ -90,7 +107,7 @@ class CaptureLoggerSkeletonTest {
     void invalidInputCountedEvenAfterClose() {
         // Validation runs BEFORE the closed check so caller-side
         // contract violations remain diagnosable through shutdown.
-        CaptureLogger logger = CaptureLogger.builder().build();
+        CaptureLogger logger = CaptureLogger.builder().sink(new ListSink()).build();
         logger.close();
         logger.log("", "https://x");
         logger.log("GET", "https://x");  // valid but logger closed → dropped
@@ -102,7 +119,7 @@ class CaptureLoggerSkeletonTest {
 
     @Test
     void statsSnapshotIsNonNullEvenWithNoTraffic() {
-        try (CaptureLogger logger = CaptureLogger.builder().build()) {
+        try (CaptureLogger logger = CaptureLogger.builder().sink(new ListSink()).build()) {
             CaptureLoggerStats s = logger.stats();
             assertNotNull(s);
             assertEquals(0, s.logged());
@@ -124,7 +141,7 @@ class CaptureLoggerSkeletonTest {
         final int callsPerThread = 25_000;
         final int total = threads * callsPerThread;
 
-        try (CaptureLogger logger = CaptureLogger.builder().build()) {
+        try (CaptureLogger logger = CaptureLogger.builder().sink(new ListSink()).build()) {
             ExecutorService pool = Executors.newFixedThreadPool(threads);
             CountDownLatch start = new CountDownLatch(1);
             CountDownLatch done = new CountDownLatch(threads);
@@ -148,9 +165,19 @@ class CaptureLoggerSkeletonTest {
             done.await(10, TimeUnit.SECONDS);
             pool.shutdown();
 
+            // Post-join, traffic is quiesced — the three counters
+            // partition all calls exactly. With the no-op Step 1
+            // pipeline this used to be `logged == total`; with the
+            // real Step 2 pipeline and a default queue, the writer
+            // can't always keep up with a 16-thread burst, so some
+            // calls land in `dropped` via overflow. Either way, no
+            // call may be lost from the bookkeeping — the original
+            // bug (volatile long ++) would have shown up as a sum
+            // strictly less than `total` because increments
+            // disappeared, not just relocated.
             CaptureLoggerStats s = logger.stats();
-            assertEquals(total, s.logged(),
-                    "every concurrent log() call must be counted exactly once");
+            assertEquals(total, s.logged() + s.dropped() + s.invalidDropped(),
+                    "every concurrent log() call must be counted in exactly one bucket; stats=" + s);
         }
     }
 }
