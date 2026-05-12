@@ -58,9 +58,9 @@ public final class CaptureLogger implements AutoCloseable {
     private final EventSink sink;
     private final RedactionPolicy headerRedaction;
     private final int maxBodyLength;
+    private final TimeSource timeSource;
     private final EventRingBuffer ring;
     private final Thread writerThread;
-    private final long startNanos = System.nanoTime();
 
     /**
      * Periodic flush cadence (events). Writer calls {@code sink.flush()}
@@ -117,9 +117,17 @@ public final class CaptureLogger implements AutoCloseable {
     private CaptureLogger(Builder b) {
         this.queueCapacity = b.queueCapacity;
         this.overflowPolicy = b.overflowPolicy;
-        this.sink = b.sink;
+        this.sink = b.sink != null ? b.sink : new StdoutSink();
         this.headerRedaction = b.headerRedaction;
         this.maxBodyLength = b.maxBodyLength;
+        // Resolve null builder fields to defaults HERE (per
+        // CaptureLogger instance) rather than memoising back into
+        // the Builder. Memoising would let a reused builder hand
+        // every subsequent logger the same `relativeMonotonic`
+        // start instant — so loggers built minutes apart would
+        // share a clock, and the second logger's first event `t`
+        // would be the minutes-later offset, not near zero.
+        this.timeSource = b.timeSource != null ? b.timeSource : TimeSource.relativeMonotonic();
         this.ring = new EventRingBuffer(queueCapacity);
         this.writerThread = new Thread(this::writerLoop, "tm-capture-writer");
         this.writerThread.setDaemon(true);
@@ -181,7 +189,7 @@ public final class CaptureLogger implements AutoCloseable {
                     dropped.increment();
                     return;
                 }
-                double t = (System.nanoTime() - startNanos) / 1_000_000_000d;
+                double t = timeSource.seconds();
                 // Defensive snapshot of the caller's headers map,
                 // with redaction applied inline. Caller may mutate /
                 // recycle their map at any time after we return; we
@@ -527,6 +535,11 @@ public final class CaptureLogger implements AutoCloseable {
         private EventSink sink;
         private RedactionPolicy headerRedaction = RedactionPolicy.defaultSafelist();
         private int maxBodyLength = 16_384;
+        // Deliberately null at field init: we want the default
+        // relativeMonotonic source's start instant to align with
+        // build() time, not with builder-construction time (a
+        // caller could build() much later than builder()).
+        private TimeSource timeSource;
 
         private Builder() {}
 
@@ -621,8 +634,27 @@ public final class CaptureLogger implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Clock used for the {@code t} field on each captured event.
+         * Defaults to {@link TimeSource#relativeMonotonic()} —
+         * seconds-since-logger-start, monotonic, immune to system
+         * clock adjustments. Use {@link TimeSource#wallclockEpochSeconds()}
+         * when captures need to cross-correlate with external
+         * absolute-time data, or a custom implementation for tests.
+         */
+        public Builder timeSource(TimeSource source) {
+            this.timeSource = Objects.requireNonNull(source, "source");
+            return this;
+        }
+
         public CaptureLogger build() {
-            if (sink == null) sink = new StdoutSink();
+            // Defaults for null fields are applied inside the
+            // CaptureLogger constructor, NOT memoised back into
+            // this builder. Memoising would let a reused builder
+            // hand every later .build() the same default sink /
+            // time source — the time-source case is the dangerous
+            // one (loggers built minutes apart would share a clock
+            // and the second's first event t would jump ahead).
             return new CaptureLogger(this);
         }
     }
