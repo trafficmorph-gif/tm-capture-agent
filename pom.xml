@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        Deliberately standalone — no Spring Boot parent, no inheritance
+        from the main app's pom. The whole point of this module is to
+        be embeddable into arbitrary consumer apps without dragging in
+        Spring / Jackson / Hibernate / etc. through transitive deps.
+
+        Built independently:
+            cd capture-agent
+            mvn package
+
+        Consumers add the produced jar to their build:
+            <dependency>
+              <groupId>com.trafficmorph</groupId>
+              <artifactId>tm-capture-agent</artifactId>
+              <version>0.1.0-SNAPSHOT</version>
+            </dependency>
+    -->
+
+    <groupId>com.trafficmorph</groupId>
+    <artifactId>tm-capture-agent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>TrafficMorph Capture Agent</name>
+    <description>
+        Low-overhead, non-blocking library for emitting JSONL traffic
+        captures consumable by TrafficMorph's capture-import flow.
+        Designed to live on hot paths: log() returns in O(100ns),
+        I/O happens on a separate daemon writer thread, the producer
+        thread never blocks on disk.
+    </description>
+
+    <properties>
+        <!--
+            Java 17 baseline (NOT 21 like the main app) so the agent
+            can be embedded into a wider range of consumer services.
+            17 still gives us records, pattern matching, sealed types,
+            and Text Blocks for the internal API.
+        -->
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <junit.version>5.10.2</junit.version>
+    </properties>
+
+    <dependencies>
+        <!--
+            Servlet API is provided / optional: the servlet-filter
+            convenience class is only loaded if the consumer has a
+            Servlet 5+ (jakarta) container on the classpath. Plain
+            (non-servlet) consumers don't need it.
+        -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <version>6.0.0</version>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- ── Test-scope only ─────────────────────────────────────── -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>
