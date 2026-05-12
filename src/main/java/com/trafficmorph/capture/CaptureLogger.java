@@ -56,6 +56,8 @@ public final class CaptureLogger implements AutoCloseable {
     private final int queueCapacity;
     private final OverflowPolicy overflowPolicy;
     private final EventSink sink;
+    private final RedactionPolicy headerRedaction;
+    private final int maxBodyLength;
     private final EventRingBuffer ring;
     private final Thread writerThread;
     private final long startNanos = System.nanoTime();
@@ -116,6 +118,8 @@ public final class CaptureLogger implements AutoCloseable {
         this.queueCapacity = b.queueCapacity;
         this.overflowPolicy = b.overflowPolicy;
         this.sink = b.sink;
+        this.headerRedaction = b.headerRedaction;
+        this.maxBodyLength = b.maxBodyLength;
         this.ring = new EventRingBuffer(queueCapacity);
         this.writerThread = new Thread(this::writerLoop, "tm-capture-writer");
         this.writerThread.setDaemon(true);
@@ -178,22 +182,72 @@ public final class CaptureLogger implements AutoCloseable {
                     return;
                 }
                 double t = (System.nanoTime() - startNanos) / 1_000_000_000d;
-                // Defensive snapshot of the caller's headers map.
-                // Caller may mutate / recycle their map at any time
-                // after we return; we hand the writer a stable copy.
+                // Defensive snapshot of the caller's headers map,
+                // with redaction applied inline. Caller may mutate /
+                // recycle their map at any time after we return; we
+                // hand the writer a stable, already-redacted copy.
+                //
                 // LinkedHashMap preserves the caller's iteration
                 // order so header round-tripping stays deterministic.
                 //
-                // The copy itself can throw if the caller is mutating
-                // the map concurrently with this call (ConcurrentModificationException
-                // from the source iterator, IndexOutOfBounds from a
-                // racing resize, ...). The outer catch turns those
-                // into invalidDropped rather than letting them
-                // propagate up the request thread.
-                Map<String, String> headersSnapshot = (headers == null || headers.isEmpty())
-                        ? null
-                        : new LinkedHashMap<>(headers);
-                CaptureEvent event = new CaptureEvent(t, method, url, headersSnapshot, body);
+                // The iteration itself can throw if the caller is
+                // mutating the map concurrently with this call
+                // (CME from the source iterator, IOOB from a racing
+                // resize, ...) — the outer catch turns those into
+                // invalidDropped rather than letting them propagate
+                // up the request thread.
+                Map<String, String> headersSnapshot = null;
+                if (headers != null && !headers.isEmpty()) {
+                    headersSnapshot = new LinkedHashMap<>(headers.size());
+                    for (Map.Entry<String, String> entry : headers.entrySet()) {
+                        String hName = entry.getKey();
+                        // Null-key entries are legal in HashMap-style
+                        // maps but meaningless in an HTTP context AND
+                        // would violate the RedactionPolicy contract
+                        // ({@code headerName} is documented non-null).
+                        // Skip them silently here so policies and the
+                        // formatter can both assume non-null names.
+                        if (hName == null) continue;
+                        String hVal = entry.getValue();
+                        String redacted = headerRedaction.redact(hName, hVal);
+                        // Identity compare: only the DROP sentinel
+                        // skips the entry. Any other return value
+                        // (including null, which preserves a
+                        // null-valued header) is stored as-is.
+                        if (redacted != RedactionPolicy.DROP) {
+                            headersSnapshot.put(hName, redacted);
+                        }
+                    }
+                    if (headersSnapshot.isEmpty()) {
+                        // Policy dropped every header (or every
+                        // entry had a null key) — emit no headers
+                        // field at all rather than an empty object,
+                        // matching the no-headers shape.
+                        headersSnapshot = null;
+                    }
+                }
+                // Body size cap. Truncating on the producer side
+                // bounds the in-memory footprint of queued events
+                // (a huge body would otherwise pin a ring slot
+                // until the writer formatted it). Common case
+                // (under cap): no allocation, single length probe.
+                //
+                // The maxBodyLength==0 case is checked FIRST so an
+                // empty body still gets dropped — the contract says
+                // "0 disables body capture entirely", and a length-
+                // greater-than check would let body="" sneak through
+                // (length 0 is not > 0).
+                String boundedBody = body;
+                if (body != null) {
+                    if (maxBodyLength == 0) {
+                        boundedBody = null;          // bodies disabled
+                    } else if (body.length() > maxBodyLength) {
+                        int truncatedChars = body.length() - maxBodyLength;
+                        boundedBody = body.substring(0, maxBodyLength)
+                                + "...[truncated " + truncatedChars + " chars]";
+                    }
+                }
+                CaptureEvent event = new CaptureEvent(t, method, url, headersSnapshot, boundedBody);
                 if (!ring.offer(event)) {
                     // Ring full. Only DROP_NEW is supported today
                     // (Step 6 adds DROP_OLD); the Builder rejects
@@ -471,6 +525,8 @@ public final class CaptureLogger implements AutoCloseable {
         private int queueCapacity = 65_536;
         private OverflowPolicy overflowPolicy = OverflowPolicy.DROP_NEW;
         private EventSink sink;
+        private RedactionPolicy headerRedaction = RedactionPolicy.defaultSafelist();
+        private int maxBodyLength = 16_384;
 
         private Builder() {}
 
@@ -524,6 +580,44 @@ public final class CaptureLogger implements AutoCloseable {
          */
         public Builder sink(EventSink sink) {
             this.sink = Objects.requireNonNull(sink, "sink");
+            return this;
+        }
+
+        /**
+         * Per-header value transform applied during the snapshot
+         * pass in {@link #log}. Defaults to
+         * {@link RedactionPolicy#defaultSafelist()} so common
+         * credential-carrying headers (Authorization, Cookie, …)
+         * are redacted without ceremony. Pass
+         * {@link RedactionPolicy#none()} for an internal-network
+         * capture where redaction overhead isn't wanted.
+         */
+        public Builder headerRedaction(RedactionPolicy policy) {
+            this.headerRedaction = Objects.requireNonNull(policy, "policy");
+            return this;
+        }
+
+        /**
+         * Maximum body length (in {@code char}s, not bytes) retained
+         * by {@link #log}. Bodies longer than this are truncated to
+         * the first {@code maxBodyLength} chars with a {@code "...
+         * [truncated N chars]"} marker appended; the truncation
+         * happens on the producer thread so the ring slot's memory
+         * footprint is bounded even when a caller passes a 10 MB
+         * payload.
+         *
+         * <p>Default is 16384 chars — fits typical JSON bodies, RTB
+         * bid requests, and similar payloads with margin. Pass
+         * {@code 0} to drop bodies entirely (kept as {@code null}
+         * in the captured event). Negative values are rejected at
+         * build time so a typo can't disable capture silently.
+         */
+        public Builder maxBodyLength(int chars) {
+            if (chars < 0) {
+                throw new IllegalArgumentException(
+                        "maxBodyLength must be >= 0, was " + chars);
+            }
+            this.maxBodyLength = chars;
             return this;
         }
 
