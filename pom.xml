@@ -114,6 +114,31 @@
             <version>12.0.16</version>
             <scope>test</scope>
         </dependency>
+        <!--
+            JMH micro-benchmarking for hot-path latency and
+            sustained throughput. Test scope: benchmarks live
+            under src/test/java/com/trafficmorph/capture/bench/
+            and are NOT invoked by the JUnit Surefire run — they
+            stay inert during `mvn test`. Run via:
+              mvn -Pbench test-compile exec:exec
+            (see the bench profile below — uses exec:exec, NOT
+            exec:java, because JMH's worker JVMs need to fork
+            with a fresh classpath which exec:java can't provide).
+            The annotation-processor artifact generates per-
+            benchmark stub classes during test-compile.
+        -->
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-core</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.openjdk.jmh</groupId>
+            <artifactId>jmh-generator-annprocess</artifactId>
+            <version>1.37</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -122,6 +147,38 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.13.0</version>
+                <executions>
+                    <!--
+                        Explicit annotation-processor path for the
+                        test compile only. JMH's generator-annprocess
+                        artifact must be on the processor path during
+                        test-compile so the @Benchmark methods get
+                        their per-class stubs generated under
+                        target/generated-test-sources. Maven's auto-
+                        discovery of processors on the classpath is
+                        unreliable for test scope under newer JDK +
+                        compiler-plugin combinations; declaring the
+                        path explicitly is the documented JMH pattern.
+                        Production compile is untouched — no
+                        processor runs, no overhead, no contamination
+                        of the deployed jar.
+                    -->
+                    <execution>
+                        <id>default-testCompile</id>
+                        <goals>
+                            <goal>testCompile</goal>
+                        </goals>
+                        <configuration>
+                            <annotationProcessorPaths>
+                                <path>
+                                    <groupId>org.openjdk.jmh</groupId>
+                                    <artifactId>jmh-generator-annprocess</artifactId>
+                                    <version>1.37</version>
+                                </path>
+                            </annotationProcessorPaths>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -135,4 +192,79 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+            Activate with `mvn -Pbench test-compile exec:exec`.
+            Runs the JMH suite via BenchmarkRunner.main, with the
+            full test classpath (test-scope deps + generated JMH
+            stubs in target/generated-test-sources). The plugin
+            binding below uses exec:exec specifically — see the
+            comment on the plugin block for why exec:java doesn't
+            work here. Surefire stays out of the picture —
+            benchmarks are NOT JUnit tests and shouldn't be
+            invoked by `mvn test`.
+        -->
+        <profile>
+            <id>bench</id>
+            <!--
+                Default value for the benchmark filter regex —
+                BenchmarkRunner reads it via System.getProperty("bench").
+                JMH's include() is a case-sensitive regex and the
+                benchmark method names use lowercase suffixes
+                (..._latency, ..._throughput_*), so filter examples
+                must match the method-name case. Override on the
+                command line:
+                  -Dbench=latency           — only the latency methods
+                  -Dbench=throughput        — only the throughput sweep
+                  -Dbench=logCheap_latency  — one specific method
+                Without the explicit property forwarding in
+                <arguments> below, a Maven-side -Dbench=... wouldn't
+                reach the spawned JVM (exec:exec doesn't auto-forward
+                Maven's own system properties to the new process).
+            -->
+            <properties>
+                <bench>CaptureLoggerBenchmark</bench>
+            </properties>
+            <build>
+                <plugins>
+                    <!--
+                        exec:exec (NOT exec:java) so we spawn a fresh
+                        JVM whose classpath is built explicitly from
+                        Maven's resolved test classpath. exec:java
+                        runs in Maven's own JVM, and JMH's forked
+                        worker JVMs then can't see the JMH /
+                        benchmark classes because they don't inherit
+                        that classpath. With exec:exec we control
+                        the command line, and the same classpath is
+                        passed onward to JMH's own forks via
+                        java.class.path (the BenchmarkRunner picks
+                        it up and threads it into JMH's jvmArgs).
+                    -->
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <configuration>
+                            <executable>java</executable>
+                            <classpathScope>test</classpathScope>
+                            <arguments>
+                                <argument>-classpath</argument>
+                                <classpath/>
+                                <!--
+                                    Forward the benchmark-filter
+                                    property explicitly. ${bench}
+                                    resolves from the profile's
+                                    <properties> default OR the
+                                    user's -Dbench=... override.
+                                -->
+                                <argument>-Dbench=${bench}</argument>
+                                <argument>com.trafficmorph.capture.bench.BenchmarkRunner</argument>
+                            </arguments>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
