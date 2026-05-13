@@ -1,7 +1,6 @@
 package com.trafficmorph.capture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.trafficmorph.capture.sink.EventSink;
@@ -53,26 +52,38 @@ class OverflowPolicyTest {
                 .build()) {
 
             // Send 8 events through a capacity-4 ring with the
-            // writer blocked. First 4 fit; rest are dropped.
+            // writer blocked. The writer thread pulls the FIRST
+            // event from the ring before blocking on sink.write,
+            // freeing one slot the producer can refill without
+            // eviction. So `logged` is typically 5 (4 ring slots +
+            // 1 slot vacated by the writer) but is 4 if the
+            // producer finishes all 8 calls before the writer
+            // pulls. Either way, logged + dropped == 8 and the
+            // surviving events form a contiguous prefix of the
+            // input (which is what DROP_NEW guarantees).
             for (int i = 0; i < 8; i++) {
                 logger.log("GET", "https://x/" + i);
             }
 
             CaptureLoggerStats s = logger.stats();
-            assertEquals(4, s.logged(), "first 4 fit: stats=" + s);
-            assertEquals(4, s.dropped(), "subsequent 4 dropped: stats=" + s);
+            assertTrue(s.logged() >= 4 && s.logged() <= 5,
+                    "DROP_NEW accepts 4 or 5 calls depending on writer/producer race; stats=" + s);
+            assertEquals(8L, s.logged() + s.dropped(),
+                    "DROP_NEW accounting must cover every call; stats=" + s);
 
             // Release the writer and let it drain.
             sink.release.countDown();
         }
-        // After close: only the FIRST 4 should have reached the sink.
-        // DROP_NEW preserves historical order — newest events are
-        // refused at the door.
+        // After close: DROP_NEW preserves historical order — the
+        // FIRST N events (N == logged) make it to the sink. Newer
+        // events are refused at the door.
         List<String> drained = sink.drained;
-        assertEquals(4, drained.size());
-        for (int i = 0; i < 4; i++) {
+        assertTrue(drained.size() >= 4 && drained.size() <= 5,
+                "drained count mirrors logged; got " + drained.size());
+        for (int i = 0; i < drained.size(); i++) {
             assertTrue(drained.get(i).contains("/x/" + i),
-                    "DROP_NEW should preserve events 0..3; got " + drained.get(i) + " at " + i);
+                    "DROP_NEW should preserve events 0.." + (drained.size() - 1)
+                            + "; got " + drained.get(i) + " at " + i);
         }
     }
 
@@ -85,37 +96,44 @@ class OverflowPolicyTest {
                 .overflowPolicy(OverflowPolicy.DROP_OLD)
                 .build()) {
 
-            // Send 8 events; with DROP_OLD, the LAST 4 should
-            // remain in the ring (the first 4 get evicted as the
-            // last 4 displace them).
+            // Send 8 events; with DROP_OLD, the LAST events
+            // should remain in the ring with older ones evicted.
             for (int i = 0; i < 8; i++) {
                 logger.log("GET", "https://x/" + i);
             }
 
             CaptureLoggerStats s = logger.stats();
-            // All 8 calls accepted as "logged" — but 4 of those
-            // were subsequently displaced. Net surviving = 4.
+            // All 8 calls accepted as "logged". The exact dropped
+            // count depends on a race: the writer thread pulls one
+            // event from the ring BEFORE blocking on sink.write,
+            // freeing a slot the producer can reuse without
+            // eviction. So dropped is typically 3 (events 0, 1, 2
+            // displaced; event 3 occupies the slot the writer
+            // vacated; events 4..7 fill the remaining slots) but
+            // can be 4 if the writer hasn't yet pulled by the
+            // time the producer is done. Either way: every call
+            // counts as logged, and no event falls outside the
+            // bookkeeping.
             assertEquals(8, s.logged(),
                     "DROP_OLD logs every call; stats=" + s);
-            assertEquals(4, s.dropped(),
-                    "4 evictions to make room for events 4..7: stats=" + s);
+            assertTrue(s.dropped() >= 3 && s.dropped() <= 4,
+                    "DROP_OLD evictions count depends on writer/producer race; "
+                            + "must be 3 or 4 with this setup; stats=" + s);
 
             sink.release.countDown();
         }
-        // Surviving events: 4..7 (the FOUR most recent).
-        // DROP_OLD preserves recency.
+        // Recency preservation: the last 4 events MUST be in the
+        // sink (the most-recent events survive DROP_OLD). Earlier
+        // events may or may not appear depending on the same race.
         List<String> drained = sink.drained;
-        assertEquals(4, drained.size());
-        for (int i = 0; i < 4; i++) {
-            assertTrue(drained.get(i).contains("/x/" + (i + 4)),
-                    "DROP_OLD should preserve events 4..7; got " + drained.get(i) + " at " + i);
-        }
-        // And NONE of the dropped events should appear.
-        for (String line : drained) {
-            for (int dropped = 0; dropped < 4; dropped++) {
-                assertNotEquals(true, line.contains("/x/" + dropped + "\""),
-                        "evicted event " + dropped + " should not appear: " + line);
-            }
+        // At minimum, every "tail" event (4..7) must have been
+        // delivered: those are produced when the ring is already
+        // saturated, so they always end up either in the ring or
+        // pulled by the writer.
+        for (int i = 4; i < 8; i++) {
+            int idx = i;
+            assertTrue(drained.stream().anyMatch(line -> line.contains("/x/" + idx + "\"")),
+                    "DROP_OLD must preserve recent event " + i + "; drained=" + drained);
         }
     }
 

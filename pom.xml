@@ -74,6 +74,46 @@
             <version>${junit.version}</version>
             <scope>test</scope>
         </dependency>
+        <!--
+            Mockito is used ONLY by the servlet-filter test suite —
+            implementing the full HttpServletRequest interface by hand
+            (50+ methods, mostly abstract) for each test scenario is
+            unmaintainable. The dep is scoped to tests so it never
+            reaches consumers; the production jar still has zero
+            transitive deps beyond the provided/optional servlet-api.
+
+            We force the SUBCLASS mock maker via
+            src/test/resources/mockito-extensions/org.mockito.plugins.MockMaker
+            because Mockito 5's default inline maker needs a JVM agent
+            self-attach which fails on some Java 21+ configurations
+            (recent OpenJDK builds tighten dynamic-agent loading by
+            default). Our tests only mock interfaces, so the subclass
+            maker's "no final classes" limitation never applies.
+        -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>5.11.0</version>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            Embedded Jetty 12 (jakarta.servlet 6 line) used by
+            CaptureServletFilterIntegrationTest to validate the
+            filter end-to-end against a real servlet container —
+            the mock-based suite covers spec-contract correctness
+            in isolation, but it cannot replicate container-driven
+            request lifecycle (real getInputStream backed by a
+            socket, real header parsing, real chain dispatch).
+            One pass through a real container catches regressions
+            mocks structurally cannot see. Test scope keeps this
+            out of the production jar.
+        -->
+        <dependency>
+            <groupId>org.eclipse.jetty.ee10</groupId>
+            <artifactId>jetty-ee10-servlet</artifactId>
+            <version>12.0.16</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

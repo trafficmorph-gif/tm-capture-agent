@@ -12,10 +12,15 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * stamping on each other; reads are O(N) but test sizes are small.
  *
  * <p>Used as the destination for {@link CaptureLogger} in unit tests
- * so assertions can run against the actual formatted lines without
- * I/O cost or flakiness from disk/stdout timing.
+ * across the whole module so assertions can run against the actual
+ * formatted lines without I/O cost or flakiness from disk/stdout
+ * timing.
+ *
+ * <p>Public so test classes in sibling packages (e.g.
+ * {@code com.trafficmorph.capture.servlet}) can use it. Lives in
+ * {@code src/test/java} so it never ships in the production jar.
  */
-class ListSink implements EventSink {
+public class ListSink implements EventSink {
 
     private final CopyOnWriteArrayList<String> lines = new CopyOnWriteArrayList<>();
     private volatile int flushes;
@@ -36,11 +41,11 @@ class ListSink implements EventSink {
         // assertions even after close.
     }
 
-    List<String> lines() {
+    public List<String> lines() {
         return Collections.unmodifiableList(lines);
     }
 
-    int flushes() {
+    public int flushes() {
         return flushes;
     }
 }
