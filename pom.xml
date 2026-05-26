@@ -32,7 +32,7 @@
 
     <groupId>com.trafficmorph</groupId>
     <artifactId>tm-capture-agent</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.1.0</version>
     <packaging>jar</packaging>
 
     <name>TrafficMorph Capture Agent</name>
