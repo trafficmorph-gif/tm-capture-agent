@@ -1,4 +1,24 @@
-# tm-capture-agent
+# TrafficMorph Capture Agent
+
+```
+████████╗██████╗  █████╗ ███████╗███████╗██╗ ██████╗
+╚══██╔══╝██╔══██╗██╔══██╗██╔════╝██╔════╝██║██╔════╝
+   ██║   ██████╔╝███████║█████╗  █████╗  ██║██║
+   ██║   ██╔══██╗██╔══██║██╔══╝  ██╔══╝  ██║██║
+   ██║   ██║  ██║██║  ██║██║     ██║     ██║╚██████╗
+   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝     ╚═╝ ╚═════╝
+        ███╗   ███╗ ██████╗ ██████╗ ██████╗ ██╗  ██╗
+        ████╗ ████║██╔═══██╗██╔══██╗██╔══██╗██║  ██║
+        ██╔████╔██║██║   ██║██████╔╝██████╔╝███████║
+        ██║╚██╔╝██║██║   ██║██╔══██╗██╔═══╝ ██╔══██║
+        ██║ ╚═╝ ██║╚██████╔╝██║  ██║██║     ██║  ██║
+        ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝
+```
+
+[![Maven Central](https://img.shields.io/maven-central/v/com.trafficmorph/tm-capture-agent?label=Maven%20Central)](https://central.sonatype.com/artifact/com.trafficmorph/tm-capture-agent)
+[![Latest tag](https://img.shields.io/github/v/tag/trafficmorph-gif/tm-capture-agent?sort=semver&label=latest)](https://github.com/trafficmorph-gif/tm-capture-agent/tags)
+[![Java version](https://img.shields.io/badge/java-17%2B-blue)](#install)
+[![License](https://img.shields.io/github/license/trafficmorph-gif/tm-capture-agent)](LICENSE)
 
 Low-overhead, non-blocking Java library that emits JSONL traffic captures
 consumable by TrafficMorph's capture-import flow. Designed to live on hot
