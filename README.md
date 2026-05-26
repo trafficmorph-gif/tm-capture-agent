@@ -7,29 +7,45 @@ writer thread, the producer never blocks on disk.
 
 - Java 17 baseline (lower than the main app's Java 21 for wider consumer reach).
 - Zero transitive deps in the production jar (Servlet API is `provided`/`optional`).
-- Built independently of the main app; consumers add the produced jar as a dependency.
+- Published to Maven Central — drop it in alongside your other deps.
 
 ---
 
-## Build
+## Install
+
+### Maven
+
+```xml
+<dependency>
+    <groupId>com.trafficmorph</groupId>
+    <artifactId>tm-capture-agent</artifactId>
+    <version>0.1.0</version>
+</dependency>
+```
+
+### Gradle (Kotlin DSL)
+
+```kotlin
+implementation("com.trafficmorph:tm-capture-agent:0.1.0")
+```
+
+### Gradle (Groovy)
+
+```groovy
+implementation 'com.trafficmorph:tm-capture-agent:0.1.0'
+```
+
+---
+
+## Build from source
 
 ```bash
 cd capture-agent
 mvn package
 ```
 
-Produces `target/tm-capture-agent-0.1.0-SNAPSHOT.jar`. Consumers add it as a
-Maven / Gradle dependency:
-
-```xml
-<dependency>
-    <groupId>com.trafficmorph</groupId>
-    <artifactId>tm-capture-agent</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
-</dependency>
-```
-
-To install into your local Maven repo for cross-project use:
+Produces `target/tm-capture-agent-<version>.jar`. To install into your
+local Maven repo for cross-project use:
 
 ```bash
 mvn install
@@ -455,3 +471,26 @@ mvn test
 Runs all JUnit tests (mock-based unit tests + one end-to-end Jetty
 integration test). Benchmarks stay inert during `mvn test` — they're
 not JUnit tests and aren't invoked by Surefire.
+
+---
+
+## Releases
+
+Releases are cut from the monorepo with:
+
+```bash
+scripts/release-tm-capture-agent.sh X.Y.Z
+```
+
+The script bumps the `pom.xml` version, the README install snippets,
+commits, tags `tm-capture-agent-vX.Y.Z` on the monorepo, mirrors the
+`capture-agent/` subtree to the public repo at
+`github.com/trafficmorph-gif/tm-capture-agent`, tags the mirror,
+and the monorepo tag push fires
+`.github/workflows/publish-tm-capture-agent.yml`, which runs the
+`release` Maven profile (sources jar + javadoc jar + GPG signing
++ upload to Maven Central via the Sonatype Central Portal).
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).

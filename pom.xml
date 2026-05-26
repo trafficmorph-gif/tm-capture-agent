@@ -15,12 +15,19 @@
             cd capture-agent
             mvn package
 
-        Consumers add the produced jar to their build:
+        Consumers add the released jar to their build (Maven Central):
             <dependency>
               <groupId>com.trafficmorph</groupId>
               <artifactId>tm-capture-agent</artifactId>
-              <version>0.1.0-SNAPSHOT</version>
+              <version>0.1.0</version>
             </dependency>
+
+        Releases:
+            scripts/release-tm-capture-agent.sh X.Y.Z
+        bumps the version here, commits, tags `tm-capture-agent-vX.Y.Z`,
+        and triggers the Maven Central publish workflow. See the
+        `release` profile below for the deploy-time plumbing
+        (sources jar, javadoc jar, GPG signing, central-publishing).
     -->
 
     <groupId>com.trafficmorph</groupId>
@@ -36,6 +43,45 @@
         I/O happens on a separate daemon writer thread, the producer
         thread never blocks on disk.
     </description>
+    <url>https://github.com/trafficmorph-gif/tm-capture-agent</url>
+    <inceptionYear>2026</inceptionYear>
+
+    <!--
+        Apache 2.0 matches the rest of the public SDK family
+        (sdk-go, sdk-python, sdk-mcp, cli). The license file lives
+        at capture-agent/LICENSE so it travels into the mirror
+        repo on every release.
+    -->
+    <licenses>
+        <license>
+            <name>The Apache Software License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>olexandrvorona</id>
+            <name>Alex Vorona</name>
+            <email>olexandrvorona@gmail.com</email>
+            <organization>TrafficMorph</organization>
+            <organizationUrl>https://trafficmorph.com</organizationUrl>
+        </developer>
+    </developers>
+
+    <scm>
+        <!--
+            SCM points at the standalone mirror repo, NOT the
+            monorepo: the mirror is what consumers see when they
+            click through "View source" on Maven Central. The
+            monorepo is private; the mirror is the public face.
+        -->
+        <connection>scm:git:https://github.com/trafficmorph-gif/tm-capture-agent.git</connection>
+        <developerConnection>scm:git:git@github.com:trafficmorph-gif/tm-capture-agent.git</developerConnection>
+        <url>https://github.com/trafficmorph-gif/tm-capture-agent</url>
+        <tag>HEAD</tag>
+    </scm>
 
     <properties>
         <!--
@@ -261,6 +307,137 @@
                                 <argument>-Dbench=${bench}</argument>
                                 <argument>com.trafficmorph.capture.bench.BenchmarkRunner</argument>
                             </arguments>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!--
+            Maven Central publishing profile. Activated only by the
+            release workflow (`mvn -P release deploy`), never during
+            regular `mvn test` / `mvn install`. Three concerns:
+
+              1. Build sources + javadoc jars — Central rejects
+                 releases without them.
+              2. GPG-sign every artifact (pom, jar, sources, javadoc).
+                 Central rejects unsigned uploads.
+              3. Upload via the new Central Publishing plugin (the
+                 successor to the legacy Sonatype OSSRH staging
+                 dance — single-step "deploy then auto-release").
+
+            One-time setup for whoever runs the first release:
+              1. Sonatype Central Portal account, namespace
+                 `com.trafficmorph` claimed (proven via DNS TXT on
+                 trafficmorph.com OR via GitHub-handle verification).
+              2. GPG key generated, public key published to
+                 keys.openpgp.org or similar, fingerprint registered
+                 in the Central Portal namespace settings.
+              3. GitHub repo secrets:
+                   CENTRAL_TOKEN_USERNAME, CENTRAL_TOKEN_PASSWORD
+                     User Token from the Portal (NOT the password).
+                   MAVEN_GPG_PRIVATE_KEY
+                     Armored export of the private key.
+                   MAVEN_GPG_PASSPHRASE
+                     Passphrase for the key.
+                 These get loaded into the publish workflow via
+                 `actions/setup-java` + the plugin's env-var pickup.
+        -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <!-- Sources jar — `mvn package` already runs
+                         this when the profile is active. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.3.1</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Javadoc jar. -doclint:none silences errors
+                         from the existing javadoc style — Central
+                         only needs the jar to exist, not perfect
+                         doclint compliance. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.7.0</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <doclint>none</doclint>
+                            <source>17</source>
+                            <quiet>true</quiet>
+                            <!-- Don't fail the build on missing
+                                 javadoc tags — Central just needs
+                                 the jar to exist, ours is rich
+                                 enough that one missing @param
+                                 shouldn't block a publish. -->
+                            <failOnError>false</failOnError>
+                            <failOnWarnings>false</failOnWarnings>
+                        </configuration>
+                    </plugin>
+
+                    <!-- GPG signing. The plugin reads the key from
+                         GPG's local keyring; the workflow imports
+                         it from MAVEN_GPG_PRIVATE_KEY before mvn
+                         runs. The passphrase comes from the
+                         GPG_PASSPHRASE env (configured below). -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.4</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- Non-interactive mode for CI;
+                                         the passphrase comes from
+                                         env, not stdin. -->
+                                    <gpgArguments>
+                                        <arg>--pinentry-mode</arg>
+                                        <arg>loopback</arg>
+                                    </gpgArguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <!-- Sonatype Central Portal publisher. Uploads
+                         the staged bundle in a single POST, then
+                         either auto-releases (autoPublish=true) or
+                         leaves it staged for manual promotion
+                         (the conservative default during initial
+                         setup). Switch autoPublish to true once
+                         the first manual release has succeeded. -->
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.6.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>false</autoPublish>
+                            <waitUntil>uploaded</waitUntil>
                         </configuration>
                     </plugin>
                 </plugins>
