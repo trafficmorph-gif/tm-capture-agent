@@ -423,12 +423,17 @@
                     </plugin>
 
                     <!-- Sonatype Central Portal publisher. Uploads
-                         the staged bundle in a single POST, then
-                         either auto-releases (autoPublish=true) or
-                         leaves it staged for manual promotion
-                         (the conservative default during initial
-                         setup). Switch autoPublish to true once
-                         the first manual release has succeeded. -->
+                         the staged bundle in a single POST and
+                         auto-releases. autoPublish was false on the
+                         first release (0.1.0) as a sanity gate —
+                         we manually clicked Publish in the Portal
+                         to confirm the artifact looked right end-
+                         to-end. Now that the pipeline is proven,
+                         flipping to true makes subsequent releases
+                         hands-off. If you ever need to inspect a
+                         bundle before it goes live (e.g. when
+                         changing the pom shape, swapping GPG keys),
+                         flip back to false for one release. -->
                     <plugin>
                         <groupId>org.sonatype.central</groupId>
                         <artifactId>central-publishing-maven-plugin</artifactId>
@@ -436,7 +441,7 @@
                         <extensions>true</extensions>
                         <configuration>
                             <publishingServerId>central</publishingServerId>
-                            <autoPublish>false</autoPublish>
+                            <autoPublish>true</autoPublish>
                             <waitUntil>uploaded</waitUntil>
                         </configuration>
                     </plugin>
