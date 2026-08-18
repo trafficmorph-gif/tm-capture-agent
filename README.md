@@ -1,4 +1,4 @@
-# TrafficMorph Capture Agent
+# TrafficMorph Traffic Capture Agent
 
 ```
 ████████╗██████╗  █████╗ ███████╗███████╗██╗ ██████╗
