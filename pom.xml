@@ -19,7 +19,7 @@
             <dependency>
               <groupId>com.trafficmorph</groupId>
               <artifactId>tm-capture-agent</artifactId>
-              <version>0.1.0</version>
+              <version>0.1.1</version>
             </dependency>
 
         Releases:
@@ -32,7 +32,7 @@
 
     <groupId>com.trafficmorph</groupId>
     <artifactId>tm-capture-agent</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
     <packaging>jar</packaging>
 
     <name>TrafficMorph Capture Agent</name>

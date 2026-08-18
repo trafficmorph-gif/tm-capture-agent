@@ -39,20 +39,20 @@ writer thread, the producer never blocks on disk.
 <dependency>
     <groupId>com.trafficmorph</groupId>
     <artifactId>tm-capture-agent</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
 </dependency>
 ```
 
 ### Gradle (Kotlin DSL)
 
 ```kotlin
-implementation("com.trafficmorph:tm-capture-agent:0.1.0")
+implementation("com.trafficmorph:tm-capture-agent:0.1.1")
 ```
 
 ### Gradle (Groovy)
 
 ```groovy
-implementation 'com.trafficmorph:tm-capture-agent:0.1.0'
+implementation 'com.trafficmorph:tm-capture-agent:0.1.1'
 ```
 
 ---
